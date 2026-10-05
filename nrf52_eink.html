@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nRF52 Clock + Image</title>
+<style>
+body{font-family:Arial,sans-serif;max-width:1050px;margin:24px auto;padding:0 16px;background:#f4f4f4}
+section{background:#fff;border:1px solid #ccc;border-radius:10px;padding:16px;margin:12px 0}
+button,input,select{font:inherit;padding:7px;margin:4px}
+button{cursor:pointer}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:5px}
+#status{font-weight:bold}
+canvas{border:1px solid #888;max-width:100%;background:#fff}
+progress{width:100%;height:20px}
+pre{background:#111;color:#eee;padding:12px;max-height:280px;overflow:auto;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>nRF52 – Đồng hồ và ảnh</h1>
+
+<section>
+<h2>1. Bluetooth</h2>
+<div class="row">
+<button id="connect">Scan / Connect nRF52</button>
+<button id="disconnect">Disconnect</button>
+<span id="status">Not connected</span>
+</div>
+<p>Use Chrome/Edge. Web Bluetooth requires HTTPS or localhost.</p>
+</section>
+
+<section>
+<h2>2. Time</h2>
+<div class="row">
+<button id="setTime">Update time/date</button>
+<select id="mode">
+<option value="4">7.5" Clock + Image</option>
+<option value="131">2.9" / 2.13" Clock + Image</option>
+</select>
+</div>
+<div id="clock"></div>
+</section>
+
+<section>
+<h2>3. Image conversion</h2>
+<div class="row">
+<select id="target">
+<option value="750">7.5" model 7 – 400×480 image</option>
+<option value="290">2.9" model 2 – 194×128 image</option>
+<option value="213">2.13" model 2 – 148×128 image</option>
+</select>
+<input id="file" type="file" accept="image/*">
+</div>
+<div class="row">
+<label>Brightness <input id="brightness" type="range" min="-100" max="100" value="0"></label>
+<label>Contrast <input id="contrast" type="range" min="-100" max="100" value="15"></label>
+<label>Red <input id="redThreshold" type="number" min="0" max="255" value="150"></label>
+<label>B/W <input id="bwThreshold" type="number" min="0" max="255" value="145"></label>
+</div>
+<button id="convert">Convert</button>
+<button id="upload">Upload to nRF52</button>
+<p id="info">No image selected.</p>
+<canvas id="preview"></canvas>
+<progress id="progress" max="100" value="0"></progress>
+<div id="progressText">Idle</div>
+</section>
+
+<section>
+<h2>Log</h2>
+<pre id="log"></pre>
+</section>
+
+<script>
+/* Exact nRF52 UUID/command values from eink.html */
+const NRF52_SERVICE_UUID='62750001-d828-918d-fb46-b6c11c675aec';
+const NRF52_CHARACTERISTIC_UUID='62750002-d828-918d-fb46-b6c11c675aec';
+const NRF52_APP_VERSION_UUID='62750003-d828-918d-fb46-b6c11c675aec';
+
+const NRF52_CMD_SET_TIME=0x20;
+const NRF52_CMD_WRITE_IMAGE=0x30;
+const NRF52_CMD_REFRESH=0x05;
+const NRF52_CMD_INIT=0x01;
+const NRF52_CMD_SEND_COMMAND=0x03;
+const NRF52_CMD_SEND_DATA=0x04;
+const NRF52_CMD_WRITE_CLOCK_IMAGE=0x34;
+const NRF52_CMD_COMMIT_CLOCK_IMAGE=0x35;
+const NRF52_IMAGE_CHUNK_SIZE=128;
+
+let device=null;
+let gattServer=null;
+let service=null;
+let epdCharacteristic=null;
+let firmwareVersion=0;
+let modelId=0;
+let panelProfile=null;
+let nrf52DisplayMode=1;
+let nrf52ImageChunkSize=NRF52_IMAGE_CHUNK_SIZE;
+let clockImageReadyWaiter=null;
+let clockImageResultWaiter=null;
+let originalImage=null;
+
+const $=id=>document.getElementById(id);
+const delay=ms=>new Promise(r=>setTimeout(r,ms));
+
+function log(s){
+  $('log').textContent+=s+'\n';
+  $('log').scrollTop=$('log').scrollHeight;
+}
+function hex(data){
+  return [...data].map(v=>v.toString(16).padStart(2,'0')).join(' ');
+}
+function progress(v,s){
+  $('progress').value=Math.max(0,Math.min(100,v));
+  $('progressText').textContent=s||'';
+}
+function putU32BE(v){
+  return [(v>>>24)&255,(v>>>16)&255,(v>>>8)&255,v&255];
+}
+
+/* Same low-level sendCommand() behavior as eink.html */
+async function sendCommand(cmd){
+  if(!epdCharacteristic) throw new Error('nRF52 is not connected.');
+  const data=cmd instanceof Uint8Array?cmd:new Uint8Array(cmd);
+  await epdCharacteristic.writeValueWithResponse(data);
+  log('TX '+hex(data.slice(0,24))+(data.length>24?' ... ['+data.length+' bytes]':''));
+}
+
+/* Same SET_TIME packet as eink.html:
+   20 + Unix timestamp BE + timezone + mode */
+async function sendNrf52Mode(mode){
+  const timestamp=Math.floor(Date.now()/1000);
+  const timezoneHours=Math.round(-new Date().getTimezoneOffset()/60);
+  const packet=new Uint8Array([
+    NRF52_CMD_SET_TIME,
+    ...putU32BE(timestamp),
+    timezoneHours&255,
+    mode
+  ]);
+  await sendCommand(packet);
+  nrf52DisplayMode=mode&0x7f;
+  log('SET_TIME timestamp='+timestamp+
+      ' timezone='+timezoneHours+
+      ' mode=0x'+mode.toString(16));
+}
+
+function waitReady(timeout=60000){
+  if(clockImageReadyWaiter)clearTimeout(clockImageReadyWaiter.timer);
+  return new Promise(resolve=>{
+    const timer=setTimeout(()=>{
+      clockImageReadyWaiter=null;resolve(false);
+    },timeout);
+    clockImageReadyWaiter={resolve,timer};
+  });
+}
+function resolveReady(ok){
+  if(!clockImageReadyWaiter)return;
+  clearTimeout(clockImageReadyWaiter.timer);
+  const r=clockImageReadyWaiter.resolve;
+  clockImageReadyWaiter=null;r(!!ok);
+}
+function waitResult(timeout=190000){
+  if(clockImageResultWaiter)clearTimeout(clockImageResultWaiter.timer);
+  return new Promise(resolve=>{
+    const timer=setTimeout(()=>{
+      clockImageResultWaiter=null;resolve(false);
+    },timeout);
+    clockImageResultWaiter={resolve,timer};
+  });
+}
+function resolveResult(ok){
+  if(!clockImageResultWaiter)return;
+  clearTimeout(clockImageResultWaiter.timer);
+  const r=clockImageResultWaiter.resolve;
+  clockImageResultWaiter=null;r(!!ok);
+}
+
+/* Notification handling copied in behavior from eink.html */
+function handleNrf52Notification(event){
+  const value=event.target.value;
+  const data=new Uint8Array(value.buffer,value.byteOffset,value.byteLength);
+  const message=new TextDecoder().decode(data);
+
+  log('RX '+hex(data));
+
+  if(message.startsWith('clock_image=')){
+    if(message.startsWith('clock_image=ready'))resolveReady(true);
+    else if(message.startsWith('clock_image=busy')){
+      resolveReady(false);resolveResult(false);
+    }else{
+      resolveResult(message.startsWith('clock_image=ok'));
+    }
+    return;
+  }
+
+  if(message.startsWith('mtu=')){
+    const mtu=parseInt(message.substring(4),10);
+    if(Number.isFinite(mtu)&&mtu>2)
+      nrf52ImageChunkSize=Math.max(18,Math.min(244,mtu-2));
+    log('MTU='+mtu+' image chunk='+nrf52ImageChunkSize);
+    return;
+  }
+
+  const isConfig=data.length>=8&&data.length<=22&&[1,2,3,4,5,7].includes(data[7]);
+  if(isConfig){
+    modelId=data[7];
+    if(data.length>11)nrf52DisplayMode=data[11];
+    panelProfile=(modelId===2&&data.length>13&&data[13]===0x21)?0x21:null;
+    $('status').textContent='Connected – model '+modelId+
+      ' – FW '+firmwareVersion+
+      (panelProfile===0x21?' – 2.13':'');
+    log('Device model='+modelId+
+        ' FW='+firmwareVersion+
+        ' panel='+(panelProfile===0x21?'2.13':'default'));
+  }
+}
+
+async function connectNrf52(){
+  service=await gattServer.getPrimaryService(NRF52_SERVICE_UUID);
+  epdCharacteristic=await service.getCharacteristic(NRF52_CHARACTERISTIC_UUID);
+
+  try{
+    const app=await service.getCharacteristic(NRF52_APP_VERSION_UUID);
+    const v=await app.readValue();
+    firmwareVersion=v.getUint8(0);
+    log('nRF52 firmware version: '+firmwareVersion);
+  }catch(e){
+    firmwareVersion=0;
+    log('Could not read firmware version.');
+  }
+
+  /* Register notification handler BEFORE startNotifications,
+     matching eink.html. */
+  epdCharacteristic.addEventListener(
+    'characteristicvaluechanged',handleNrf52Notification);
+  await epdCharacteristic.startNotifications();
+
+  $('status').textContent='Connected – nRF52 – FW '+firmwareVersion;
+
+  await sendCommand(new Uint8Array([NRF52_CMD_INIT]));
+  await delay(80);
+  log('nRF52 connected; display initialized.');
+}
+
+async function connect(){
+  if(!navigator.bluetooth)
+    throw new Error('Web Bluetooth is unavailable in this browser.');
+
+  device=await navigator.bluetooth.requestDevice({
+    acceptAllDevices:true,
+    optionalServices:[NRF52_SERVICE_UUID]
+  });
+
+  device.addEventListener('gattserverdisconnected',()=>{
+    epdCharacteristic=null;
+    gattServer=null;
+    $('status').textContent='Disconnected';
+    log('GATT disconnected.');
+  });
+
+  gattServer=await device.gatt.connect();
+  log('GATT connected.');
+  await connectNrf52();
+}
+
+/* Same image quantization used by "Đồng hồ và ảnh":
+   NO dithering. Fixed B/W + red threshold. */
+function quantizeClockImageCanvas(ctx,applyAdjustments=true){
+  const canvas=ctx.canvas;
+  const brightness=applyAdjustments?
+    (parseInt($('brightness').value,10)||0):0;
+  const contrastValue=applyAdjustments?
+    (parseInt($('contrast').value,10)||0):0;
+  const redThreshold=parseInt($('redThreshold').value,10)||150;
+  const bwThreshold=parseInt($('bwThreshold').value,10)||145;
+
+  const contrast=(259*(contrastValue+255))/
+                 (255*(259-contrastValue));
+
+  const imageData=ctx.getImageData(
+    0,0,canvas.width,canvas.height);
+  const p=imageData.data;
+
+  for(let i=0;i<p.length;i+=4){
+    let r=contrast*(p[i]-128)+128+brightness*2.55;
+    let g=contrast*(p[i+1]-128)+128+brightness*2.55;
+    let b=contrast*(p[i+2]-128)+128+brightness*2.55;
+
+    r=Math.max(0,Math.min(255,r));
+    g=Math.max(0,Math.min(255,g));
+    b=Math.max(0,Math.min(255,b));
+
+    const red=r>=redThreshold&&r-Math.max(g,b)>=20;
+    const luma=0.299*r+0.587*g+0.114*b;
+
+    if(red){
+      p[i]=255;p[i+1]=0;p[i+2]=0;
+    }else if(luma<bwThreshold){
+      p[i]=0;p[i+1]=0;p[i+2]=0;
+    }else{
+      p[i]=255;p[i+1]=255;p[i+2]=255;
+    }
+    p[i+3]=255;
+  }
+  ctx.putImageData(imageData,0,0);
+}
+
+function targetConfig(){
+  const t=$('target').value;
+  if(t==='750')
+    return {width:400,height:480,fullWidth:800,
+            planeBytes:24000,mode:4,transfer:'clock-image-v54'};
+  if(t==='213')
+    return {width:148,height:128,fullWidth:250,
+            planeBytes:4000,mode:0x83,transfer:'ssd1680-fullframe'};
+  return {width:194,height:128,fullWidth:296,
+          planeBytes:4736,mode:0x83,transfer:'ssd1680-fullframe'};
+}
+
+function renderPreview(){
+  const cfg=targetConfig();
+  const canvas=$('preview');
+  canvas.width=cfg.width;
+  canvas.height=cfg.height;
+
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  ctx.fillStyle='#fff';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  if(originalImage){
+    const ratio=Math.min(
+      canvas.width/originalImage.width,
+      canvas.height/originalImage.height);
+    const w=originalImage.width*ratio;
+    const h=originalImage.height*ratio;
+    ctx.drawImage(originalImage,
+      (canvas.width-w)/2,(canvas.height-h)/2,w,h);
+  }
+
+  quantizeClockImageCanvas(ctx,true);
+  return canvas;
+}
+
+/* Exact clockImageCanvasToPlanes() algorithm from eink.html */
+function clockImageCanvasToPlanes(canvas){
+  const pixels=canvas.getContext('2d')
+    .getImageData(0,0,canvas.width,canvas.height).data;
+
+  const black=[],red=[];
+  let blackByte=0,redByte=0,bitCount=0;
+
+  const pixelOffsets=[];
+  for(let i=0;i<pixels.length;i+=4)pixelOffsets.push(i);
+
+  for(const i of pixelOffsets){
+    const isBlack=
+      pixels[i]===0&&pixels[i+1]===0&&pixels[i+2]===0;
+    const isRed=
+      pixels[i]===255&&pixels[i+1]===0&&pixels[i+2]===0;
+
+    blackByte=(blackByte<<1)|(isBlack?0:1);
+    redByte=(redByte<<1)|(isRed?0:1);
+    bitCount++;
+
+    if(bitCount===8){
+      black.push(blackByte);
+      red.push(redByte);
+      blackByte=0;redByte=0;bitCount=0;
+    }
+  }
+  return {black:new Uint8Array(black),red:new Uint8Array(red)};
+}
+
+/* Exact column-first canvas2bytes_bw() behavior used for
+   the SSD1680 full-frame path. */
+function canvas2bytes_bw(canvas,type='bw'){
+  const data=canvas.getContext('2d')
+    .getImageData(0,0,canvas.width,canvas.height).data;
+  const arr=[];
+  let buffer=[];
+
+  for(let x=canvas.width-1;x>=0;x--){
+    for(let y=0;y<canvas.height;y++){
+      const i=(canvas.width*4*y)+x*4;
+      if(type!=='bwr'){
+        buffer.push(
+          data[i]>0&&data[i+1]>0&&data[i+2]>0?1:0);
+      }else{
+        buffer.push(
+          data[i]>0&&data[i+1]===0&&data[i+2]===0?1:0);
+      }
+      if(buffer.length===8){
+        arr.push(parseInt(buffer.join(''),2));
+        buffer=[];
+      }
+    }
+  }
+  return new Uint8Array(arr);
+}
+
+function ssd1680ClockImageToFullPlanes(canvas,cfg){
+  const full=document.createElement('canvas');
+  full.width=cfg.fullWidth;
+  full.height=128;
+
+  const ctx=full.getContext('2d',{willReadFrequently:true});
+  ctx.fillStyle='#fff';
+  ctx.fillRect(0,0,full.width,128);
+  ctx.drawImage(canvas,0,0);
+
+  const black=canvas2bytes_bw(full);
+  const red=canvas2bytes_bw(full,'bwr')
+    .map(byte=>byte^0xff);
+
+  return {black,red};
+}
+
+/* Exact nRF52 WRITE_IMAGE transport from eink.html */
+async function sendNrf52ImagePlane(
+  data,blackPlane,progressStart=0,progressEnd=100){
+
+  const chunkSize=nrf52ImageChunkSize;
+  const total=Math.ceil(data.length/chunkSize);
+
+  for(let offset=0,part=0;
+      offset<data.length;
+      offset+=chunkSize,part++){
+
+    const chunk=data.slice(offset,offset+chunkSize);
+    const begin=offset===0?0x00:0xf0;
+    const plane=blackPlane?0x0f:0x00;
+
+    const packet=new Uint8Array([
+      NRF52_CMD_WRITE_IMAGE,
+      begin|plane,
+      ...chunk
+    ]);
+
+    await sendCommand(packet);
+
+    const completed=part+1;
+    const percent=progressStart+
+      (completed/total)*(progressEnd-progressStart);
+
+    progress(percent,
+      'Sending '+(blackPlane?'black':'red')+
+      ': '+completed+'/'+total);
+
+    await delay(8);
+  }
+}
+
+/* Exact 7.5" Clock+Image transport */
+async function sendClockImagePlane(
+  data,blackPlane,startPercent,endPercent){
+
+  const chunkSize=nrf52ImageChunkSize;
+  const total=Math.ceil(data.length/chunkSize);
+
+  for(let offset=0,part=0;
+      offset<data.length;
+      offset+=chunkSize,part++){
+
+    const chunk=data.slice(offset,offset+chunkSize);
+    const cfg=(offset===0?0x00:0xf0)|
+              (blackPlane?0x0f:0x00);
+
+    await sendCommand(new Uint8Array([
+      NRF52_CMD_WRITE_CLOCK_IMAGE,cfg,...chunk
+    ]));
+
+    const completed=part+1;
+    progress(
+      startPercent+
+      (completed/total)*(endPercent-startPercent),
+      'Sending '+(blackPlane?'black':'red')+
+      ': '+completed+'/'+total);
+
+    await delay(8);
+  }
+}
+
+/* Exact SSD1680 register setup from eink.html */
+async function sendNrf52Register(command,data=[]){
+  await sendCommand(
+    new Uint8Array([NRF52_CMD_SEND_COMMAND,command]));
+  if(data.length)
+    await sendCommand(
+      new Uint8Array([NRF52_CMD_SEND_DATA,...data]));
+}
+
+async function openNrf290ClockImagePlane(blackPlane){
+  await sendNrf52Register(0x11,[0x03]);
+  await sendNrf52Register(0x44,[0x01,0x10]);
+  await sendNrf52Register(0x45,[0x68,0x00,0x27,0x01]);
+  await sendNrf52Register(0x4e,[0x01]);
+  await sendNrf52Register(0x4f,[0x68,0x00]);
+  await sendNrf52Register(blackPlane?0x24:0x26);
+}
+
+async function sendNrf290ClockImagePlane(
+  data,blackPlane,startPercent,endPercent){
+
+  await openNrf290ClockImagePlane(blackPlane);
+
+  const chunkSize=Math.min(nrf52ImageChunkSize,240);
+  const total=Math.ceil(data.length/chunkSize);
+
+  for(let offset=0,part=0;
+      offset<data.length;
+      offset+=chunkSize,part++){
+
+    const chunk=data.slice(offset,offset+chunkSize);
+    await sendCommand(
+      new Uint8Array([NRF52_CMD_SEND_DATA,...chunk]));
+
+    const completed=part+1;
+    progress(
+      startPercent+
+      (completed/total)*(endPercent-startPercent),
+      'Sending '+(blackPlane?'black':'red')+
+      ': '+completed+'/'+total);
+
+    await delay(8);
+  }
+}
+
+async function uploadClockImage(){
+  if(!epdCharacteristic)
+    throw new Error('Connect nRF52 first.');
+  if(!originalImage)
+    throw new Error('Select an image first.');
+
+  const cfg=targetConfig();
+  const canvas=renderPreview();
+
+  progress(1,'Preparing image...');
+
+  if(cfg.transfer==='clock-image-v54'){
+    /* Firmware 7.5 reports clock_image=ready after the
+       regional clock refresh. */
+    const readyPromise=waitReady(60000);
+
+    await sendNrf52Mode(cfg.mode);
+    progress(2,'Waiting for clock_image=ready...');
+
+    if(!await readyPromise)
+      throw new Error(
+        'Device did not report clock_image=ready.');
+
+    const planes=clockImageCanvasToPlanes(canvas);
+
+    if(planes.black.length!==cfg.planeBytes||
+       planes.red.length!==cfg.planeBytes)
+      throw new Error(
+        'Wrong plane size: '+
+        planes.black.length+'/'+planes.red.length);
+
+    const resultPromise=waitResult(190000);
+
+    await sendClockImagePlane(
+      planes.black,true,5,47);
+    await sendClockImagePlane(
+      planes.red,false,47,89);
+
+    progress(90,'Committing image...');
+
+    await sendCommand(
+      new Uint8Array([NRF52_CMD_COMMIT_CLOCK_IMAGE]));
+
+    if(!await resultPromise)
+      throw new Error(
+        'Device did not confirm clock image.');
+
+  }else{
+    /* 2.9 / 2.13 uses the full-frame SSD1680 path. */
+    await sendCommand(
+      new Uint8Array([NRF52_CMD_INIT]));
+    await delay(150);
+
+    const planes=ssd1680ClockImageToFullPlanes(canvas,cfg);
+
+    if(planes.black.length!==cfg.planeBytes||
+       planes.red.length!==cfg.planeBytes)
+      throw new Error(
+        'Wrong plane size: '+
+        planes.black.length+'/'+planes.red.length);
+
+    await sendNrf52ImagePlane(
+      planes.black,true,5,46);
+    await sendNrf52ImagePlane(
+      planes.red,false,46,87);
+
+    progress(89,'Setting clock mode and refreshing...');
+
+    await sendNrf52Mode(cfg.mode);
+    await delay(12000);
+  }
+
+  progress(100,
+    'Done – nRF52 clock continues updating.');
+}
+
+$('connect').onclick=async()=>{
+  try{
+    await connect();
+  }catch(e){
+    $('status').textContent='Connection failed';
+    log('ERROR '+(e.message||e));
+  }
+};
+
+$('disconnect').onclick=()=>{
+  try{
+    if(device?.gatt?.connected)device.gatt.disconnect();
+  }catch(e){}
+};
+
+$('setTime').onclick=async()=>{
+  try{
+    await sendNrf52Mode(Number($('mode').value));
+    log('Current time/date sent to nRF52.');
+  }catch(e){
+    log('ERROR '+(e.message||e));
+  }
+};
+
+$('file').onchange=()=>{
+  const file=$('file').files[0];
+  if(!file)return;
+
+  const img=new Image();
+  img.onload=()=>{
+    originalImage=img;
+    $('info').textContent=
+      file.name+' – '+img.naturalWidth+'×'+img.naturalHeight;
+    renderPreview();
+    URL.revokeObjectURL(img.src);
+  };
+  img.src=URL.createObjectURL(file);
+};
+
+$('convert').onclick=()=>{
+  if(!originalImage){
+    log('Select an image first.');
+    return;
+  }
+  renderPreview();
+};
+
+$('target').onchange=()=>{
+  if(originalImage)renderPreview();
+};
+
+$('upload').onclick=async()=>{
+  try{
+    await uploadClockImage();
+  }catch(e){
+    progress(0,'Upload failed: '+(e.message||e));
+    log('ERROR '+(e.message||e));
+  }
+};
+
+setInterval(()=>{
+  $('clock').textContent=
+    'Browser time: '+new Date().toLocaleString();
+},1000);
+</script>
+</body>
+</html>
